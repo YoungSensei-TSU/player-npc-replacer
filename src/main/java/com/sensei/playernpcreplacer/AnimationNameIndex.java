@@ -156,11 +156,12 @@ class AnimationNameIndex
 	// PlayerNpcReplacerPlugin#findActionAnimationSubstitute's ActionContext
 	// parameter) when the actor is known to currently be attacking or
 	// defending, rather than picking blindly among every non-excluded nearby
-	// candidate. RANGED/CAST count as attack-flavored (they're still an
-	// outgoing offensive action); BLOCK/PARRY count as defend-flavored
-	// alongside the more common DEFEND.
+	// candidate. RANGED/CAST/MELEE count as attack-flavored (they're still an
+	// outgoing offensive action - MELEE is a standalone attack kind in its
+	// own right, e.g. Grimy Lizard's actual attack is named GRIMY_LIZARD_MELEE);
+	// BLOCK/PARRY count as defend-flavored alongside the more common DEFEND.
 	private static final String[] ATTACK_KEYWORDS = {
-		"ATTACK", "SWING", "STAB", "SLASH", "CRUSH", "SPECIAL", "CAST", "RANGED"
+		"ATTACK", "SWING", "STAB", "SLASH", "CRUSH", "SPECIAL", "CAST", "RANGED", "MELEE"
 	};
 	private static final String[] DEFEND_KEYWORDS = {
 		"DEFEND", "BLOCK", "PARRY"
@@ -448,6 +449,27 @@ class AnimationNameIndex
 	List<Integer> filterActionAnimations(List<Integer> ids)
 	{
 		return filterByKeywords(ids, ACTION_KEYWORDS);
+	}
+
+	/**
+	 * @return the same preference as {@link #filterActionAnimations}, but
+	 * with anything matching {@link #DEFEND_KEYWORDS} excluded - for a
+	 * context where a defend/block/hit-reaction animation would look wrong
+	 * even as a loose "something action-like" pick, not just a context where
+	 * it's merely not preferred. Used for {@code ActionContext#NONE}
+	 * (skilling): confirmed live by the user that mining sometimes picked a
+	 * DEFEND-flavored animation from a family with no dedicated attack match,
+	 * which reads as "getting hit" while chopping/mining/fishing - {@link
+	 * #ACTION_KEYWORDS} treats DEFEND/BLOCK/PARRY as generically
+	 * combat-flavored (useful when the actor genuinely IS attacking or
+	 * defending and level 1's stricter filter came up empty), but that's
+	 * exactly wrong for an actor doing neither.
+	 */
+	List<Integer> filterActionAnimationsExcludingDefend(List<Integer> ids)
+	{
+		final List<Integer> result = filterActionAnimations(ids);
+		result.removeAll(filterDefendAnimations(ids));
+		return result;
 	}
 
 	/**

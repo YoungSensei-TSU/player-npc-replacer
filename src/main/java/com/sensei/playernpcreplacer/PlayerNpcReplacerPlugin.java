@@ -395,6 +395,14 @@ public class PlayerNpcReplacerPlugin extends Plugin
 	// worked example.
 	private final Map<String, Integer> lastPlayerActionSubstituteId = new HashMap<>();
 
+	// SESSION-ONLY, not persisted: player names whose action layer was just
+	// force-cleared to -1 by replace() switching them onto a new npc, still
+	// awaiting the follow-up write of that new npc's own idle animation on
+	// onClientTick's NEXT pass - see both for the full explanation. A one-tick
+	// gap (wipe, THEN play the new one) rather than writing the new idle in
+	// the very same call as the wipe.
+	private final Set<String> pendingIdleAfterSwitch = new HashSet<>();
+
 	// SESSION-ONLY, not persisted: overridden actor -> the game tick number
 	// (see Client#getTickCount()) until which a just-received hitsplat should
 	// bias findActionAnimationSubstitute toward a defend/block-flavored
@@ -1326,21 +1334,59 @@ public class PlayerNpcReplacerPlugin extends Plugin
 		}
 		composition.setHash();
 
-		// Force onClientTick to recompute this player's action-layer
-		// substitute on its next pass, exactly like applyClone/applySelfClone
-		// do via NpcClone/SelfClone#setLastAnimationId(Integer.MIN_VALUE) -
-		// the plain player path is the one that never had this, and needed it
-		// for the same reason.
+		// Clears any action-animation substitute a PREVIOUS override already
+		// wrote onto this player - same pattern, same reasoning, as
+		// revertTransformOnly's identical clear (see its comment). Originally
+		// this only cleared the TRACKING entry (lastPlayerActionSubstituteId)
+		// and relied on onClientTick's next pass to notice the mismatch and
+		// compute+write a fresh substitute for the NEW replacement. That's
+		// not reliable enough to also clear the FIELD itself, and leaving a
+		// gap there turned out to be a real, confirmed-live bug with two
+		// symptoms:
 		//
-		// Without it, applying an override to a player who is ALREADY
-		// mid-action leaves them on a stale animation: the tick loop reads
-		// getAnimation(), sees the substitute a PREVIOUS override already
-		// wrote there, matches it against this same map, and takes the
-		// "that's our own substitute, leave it completely alone" branch - so
-		// it never switches to the new replacement's animation at all, and
-		// the old npc's animation keeps playing until the engine happens to
-		// set a fresh one on its own.
-		lastPlayerActionSubstituteId.remove(name);
+		// 1. Switching a player from one npc override to another WHILE
+		// mid-action could visibly show the OLD npc's substitute animation on
+		// the NEW npc's model for a stretch, not just switching cleanly -
+		// because the recompute that would fix it is gated on {@code
+		// !override.isAnimationsDisabled()}; if the NEW override happens to
+		// already have animations paused, that recompute never runs at all,
+		// so nothing ever touches the stale field again.
+		//
+		// 2. Confirmed live by the user as the more serious half: once stuck
+		// like that, even fully REMOVING the override afterward didn't fix
+		// it. revertTransformOnly's own clear is gated on this exact same
+		// map having an entry to remove - but this method had ALREADY
+		// cleared it at switch time (case 1), so by the time of removal
+		// there was nothing left to find, and revertTransformOnly's guard
+		// silently skipped the write. The model correctly reverted (that
+		// part isn't gated on this map at all); the animation stayed frozen
+		// on the old npc's substitute forever, since nothing was ever going
+		// to touch it again.
+		//
+		// Forcing this immediately, rather than only clearing the tracking and
+		// waiting on a future recompute that might never come, closes both:
+		// instead of ever showing a stale animation belonging to an npc
+		// they're no longer overridden as, the player now visibly shows -1
+		// (nothing) right away, with the NEW replacement's own idle queued to
+		// follow one tick later via pendingIdleAfterSwitch (see onClientTick's
+		// consumption of it) - a deliberate wipe-THEN-play sequence rather
+		// than writing the new idle in this same call, so the old animation
+		// is never directly swapped for the new one on the same frame.
+		//
+		// Queueing the follow-up idle write at all, rather than leaving A at
+		// -1 and letting it sit, matters too - confirmed live by the user: an
+		// actor's action layer doesn't automatically resolve to a nicely
+		// looping idle just because it's -1 and the standing config/P above
+		// were freshly set. It reads as the model going STATIC/frozen instead
+		// of actively idling, the same "im just static" quirk reported much
+		// earlier for the paused+equipment-shown path - -1 alone means "no
+		// action layer override", not "play something". A real animation id
+		// has to be written to actually show motion.
+		if (lastPlayerActionSubstituteId.remove(name) != null)
+		{
+			player.setAnimation(-1);
+			pendingIdleAfterSwitch.add(name);
+		}
 	}
 
 	/**
@@ -1375,6 +1421,14 @@ public class PlayerNpcReplacerPlugin extends Plugin
 		{
 			player.setAnimation(-1);
 		}
+		// Also drop any pending post-switch idle write replace() may have
+		// queued (see pendingIdleAfterSwitch's doc) - otherwise a switch
+		// followed immediately by removal (before the queued idle's next
+		// tick fires) leaves it sitting there, and it would get wrongly
+		// consumed by some LATER, unrelated fresh apply for this same player
+		// name instead of being tied to the switch it was actually queued
+		// for.
+		pendingIdleAfterSwitch.remove(name);
 
 		final int[] capturedEquipmentIds = capturedPlayerEquipmentIds.remove(name);
 		if (capturedEquipmentIds != null)
@@ -1794,12 +1848,28 @@ public class PlayerNpcReplacerPlugin extends Plugin
 				// named in a way this code recognises from being handed a human
 				// kick - confirmed live by the user (Grimy Lizard). The
 				// blocklist in AnimationNameIndex is what keeps level 3 safe.
-				List<Integer> pool = context == ActionContext.ATTACK ? animationNameIndex.filterAttackAnimations(living)
-					: context == ActionContext.DEFEND ? animationNameIndex.filterDefendAnimations(living)
-					: Collections.emptyList();
+				//
+				// ActionContext.NONE (skilling - not attacking, not recently
+				// hit) is deliberately treated like ATTACK at level 1, and gets
+				// a DEFEND-excluding variant of level 2, rather than falling
+				// straight to the unfiltered level-2 preference. Confirmed live
+				// by the user: mining/woodcutting/etc sometimes picked a
+				// DEFEND-flavored (block/hit-reaction) animation from General
+				// Graardor's family, which reads as "getting hit" while
+				// skilling. filterActionAnimations alone can't distinguish
+				// that - it treats DEFEND/BLOCK/PARRY as generically
+				// combat-flavored, which is right for an actor genuinely in
+				// combat but wrong for one that's neither attacking nor being
+				// attacked. Level 3 still allows anything, including a defend
+				// animation, as the absolute last resort - any same-family
+				// animation beats a foreign human-rig one.
+				List<Integer> pool = context == ActionContext.DEFEND ? animationNameIndex.filterDefendAnimations(living)
+					: animationNameIndex.filterAttackAnimations(living);
 				if (pool.isEmpty())
 				{
-					pool = animationNameIndex.filterActionAnimations(living);
+					pool = context == ActionContext.NONE
+						? animationNameIndex.filterActionAnimationsExcludingDefend(living)
+						: animationNameIndex.filterActionAnimations(living);
 				}
 				if (pool.isEmpty())
 				{
@@ -1930,13 +2000,27 @@ public class PlayerNpcReplacerPlugin extends Plugin
 	 * ActionContext#DEFEND} takes priority over {@link ActionContext#ATTACK}
 	 * when both would apply (e.g. trading hits with a target: mid-swing AND
 	 * just hit in the same window) on the theory that a hitsplat is a more
-	 * specific, deliberate signal than merely having a target selected.
+	 * specific, deliberate signal than merely having a target selected. That
+	 * priority is now conditional on ALSO being in combat at all (see the
+	 * {@code getInteracting()} check below) - a bare recent-hit signal used to
+	 * be enough on its own, which was wrong: {@link #recentlyHitUntilTick}
+	 * fires on ANY hitsplat, including incidental damage while doing
+	 * something totally unrelated to combat (poison, a stray hit from a
+	 * nearby aggressive monster while skilling, splash damage). Confirmed
+	 * live by the user: mining while occasionally taking a hit intermittently
+	 * flipped General Graardor's substitute from an ATTACK-flavored animation
+	 * to a DEFEND-flavored (block/hit-reaction) one, for a raw animation that
+	 * was a mining swing the entire time, never an actual defend.
+	 * <p>
 	 * {@link ActionContext#ATTACK} is inferred from {@link
 	 * Actor#getInteracting()} being non-null (a target is selected) - not
 	 * scoped further to "and an action animation is currently playing",
 	 * since the caller already only reaches this when one is (see both call
 	 * sites). {@link ActionContext#DEFEND} comes from {@link
-	 * #recentlyHitUntilTick}, populated by {@link #onHitsplatApplied}.
+	 * #recentlyHitUntilTick}, populated by {@link #onHitsplatApplied} - now
+	 * additionally requiring {@code getInteracting() != null}, since a
+	 * skilling action never sets it, which is exactly the signal that
+	 * separates "trading hits with a target" from "got clipped while mining".
 	 */
 	private ActionContext resolveActionContext(Actor actor)
 	{
@@ -1947,12 +2031,13 @@ public class PlayerNpcReplacerPlugin extends Plugin
 		{
 			return ActionContext.DEATH;
 		}
+		final boolean inCombat = actor.getInteracting() != null;
 		final Integer hitUntilTick = recentlyHitUntilTick.get(actor);
-		if (hitUntilTick != null && client.getTickCount() <= hitUntilTick)
+		if (inCombat && hitUntilTick != null && client.getTickCount() <= hitUntilTick)
 		{
 			return ActionContext.DEFEND;
 		}
-		if (actor.getInteracting() != null)
+		if (inCombat)
 		{
 			return ActionContext.ATTACK;
 		}
@@ -3009,9 +3094,43 @@ public class PlayerNpcReplacerPlugin extends Plugin
 				}
 			}
 
+			final String name = override.getSourceName();
+
+			// One tick after replace() wiped this player's action layer to -1
+			// for a switch (see its own comment for the full "wipe THEN play"
+			// reasoning), apply the new replacement's own idle here - always
+			// consumed/cleared regardless of paused state, so a stale pending
+			// flag can never fire unexpectedly on some LATER tick after
+			// animations get un-paused, but only actually WRITES the idle
+			// when not paused; paused already has its own established
+			// freeze/show-raw behavior that this must not fight.
+			if (pendingIdleAfterSwitch.remove(name))
+			{
+				if (!override.isAnimationsDisabled())
+				{
+					final NpcAnimationSet animationSet = getOrLookupAnimationSet(override.getReplacement().getId());
+					final int idleId = animationSet != null ? animationSet.getIdlePoseAnimation() : -1;
+					player.setAnimation(idleId);
+					if (idleId != -1)
+					{
+						// Same frame-reset requirement as the "genuinely new"
+						// branch below (see its own comment) - a freshly
+						// written id needs a freshly reset frame counter.
+						player.setAnimationFrame(0);
+						// Track it as our own substitute so the NEXT pass
+						// recognizes it and leaves it alone, instead of
+						// treating this freshly-applied idle as "a genuinely
+						// new engine-set animation" and immediately
+						// recomputing (and likely replacing) it with
+						// something else.
+						lastPlayerActionSubstituteId.put(name, idleId);
+					}
+				}
+				continue;
+			}
+
 			if (!override.isAnimationsDisabled())
 			{
-				final String name = override.getSourceName();
 				// This loop both READS and WRITES the same field, so the very
 				// first thing it has to do is work out whether what it's
 				// reading is a genuine engine-set animation or just its OWN
