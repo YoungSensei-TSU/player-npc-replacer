@@ -235,8 +235,7 @@ import net.runelite.client.ui.overlay.OverlayManager;
 @PluginDescriptor(
 	name = "Player NPC Replacer",
 	description = "Shift-right-click a player for an option to replace their model with an NPC's",
-	tags = {"cosmetic", "npc", "player", "replace", "transform", "model", "visual", "sensei"},
-	enabledByDefault = false
+	tags = {"cosmetic", "npc", "player", "replace", "transform", "model", "visual", "sensei"}
 )
 public class PlayerNpcReplacerPlugin extends Plugin
 {
