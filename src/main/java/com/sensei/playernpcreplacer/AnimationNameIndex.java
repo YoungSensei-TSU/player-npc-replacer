@@ -94,13 +94,15 @@ import lombok.extern.slf4j.Slf4j;
  * <p>
  * <b>Still a heuristic, not a guarantee</b> - id-block allocation isn't
  * universal (a later-added animation can land far outside its npc's original
- * block; {@code GODWARS_BANDOS_ATTACK_LOOP = 8765} is itself an example,
- * ~1700 ids away from the rest of Graardor's block, and would be missed by a
- * window search centered on the walk id). Expect this to find a useful,
- * CORRECTLY-scoped block for npcs whose full combat kit shipped together
- * under one consistent naming prefix, and nothing for npcs where either
- * condition doesn't hold - a miss is the safe failure mode; a wrong-but-named
- * neighbor is the one this fix specifically closes off.
+ * block; {@code GODWARS_BANDOS_ATTACK_LOOP = 8765} is ~1700 ids from the rest
+ * of Graardor's block, and K'ril Tsutsaroth's own combat kit sits ~2880 ids
+ * from his walk id - both now within {@link #WINDOW_AFTER}, see its own doc
+ * for why that's set as high as it is and how far it's safe to go). Expect
+ * this to find a useful, CORRECTLY-scoped block for npcs whose full combat
+ * kit shipped together under one consistent naming prefix, and nothing for
+ * npcs where either condition doesn't hold - a miss is the safe failure
+ * mode; a wrong-but-named neighbor is the one this fix specifically closes
+ * off.
  * <p>
  * {@link #filterAttackAnimations}/{@link #filterDefendAnimations} narrow an
  * already-found candidate list further by keyword, so {@code
@@ -122,14 +124,33 @@ import lombok.extern.slf4j.Slf4j;
 @Singleton
 class AnimationNameIndex
 {
-	// How far past/before the anchor id to search - covers Graardor's entire
-	// confirmed WALK(7016)-to-SPOT(7023) block (+7) with real margin. Wider
-	// than it needs to be for just that block on purpose: the mandatory
-	// same-prefix check below is what actually keeps results correctly
-	// scoped now, not the window size, so there's much less risk in casting a
-	// slightly wider net for npcs whose own block is bigger.
+	// How far past/before the anchor id to search. WINDOW_AFTER=2900 (not a
+	// small number) is deliberate and evidence-based, not a guess - confirmed
+	// live by the user: K'ril Tsutsaroth's own anchor is GODWARS_ZAMORAK_WALK
+	// = 4070, but his actual DEFEND/ATTACK/DEATH/MAGIC_ATTACK ids sit at
+	// 6947-6950, a +2877-2880 gap far outside what an earlier, much smaller
+	// window (60) ever covered - explaining a report of "K'ril has real
+	// animations but we fall back to human kick" that turned out to be a
+	// window-size problem, not a keyword-exclusion one. This class's own
+	// doc already predicted the shape of this failure (citing
+	// GODWARS_BANDOS_ATTACK_LOOP = 8765, +1749 from Graardor's own walk id,
+	// as "would be missed by a window search centered on the walk id") but
+	// had accepted it as a limitation rather than fixed it; K'ril's case
+	// showed the gap can be even larger, making that no longer acceptable.
+	//
+	// Safe to widen this far ONLY because of the mandatory same-prefix check
+	// below - it, not window size, is what keeps results scoped to the right
+	// npc. Confirmed the boundary carefully before picking 2900: immediately
+	// after K'ril's own last real entry (GODWARS_ZAMORAK_MAGIC_ATTACK_SPOTANIM
+	// = 6951) comes GODWARS_ZAMORAK_BDYGRD_RANGED = 7077 - a DIFFERENT npc (a
+	// ranged Zamorak bodyguard, not K'ril) that happens to share the same
+	// top-level "GODWARS_ZAMORAK_" prefix despite being an unrelated entity,
+	// and whose RANGED animation would be wrongly attributed to K'ril if the
+	// window reached that far (RANGED is a positive ACTION_KEYWORDS match,
+	// not something EXCLUDED_KEYWORDS would catch). 2900 lands at 6970 -
+	// comfortably past K'ril's real block, comfortably short of 7077.
 	private static final int WINDOW_BEFORE = 10;
-	private static final int WINDOW_AFTER = 60;
+	private static final int WINDOW_AFTER = 2900;
 
 	// Used to prefer a semantically-appropriate candidate (see
 	// PlayerNpcReplacerPlugin#findActionAnimationSubstitute's ActionContext

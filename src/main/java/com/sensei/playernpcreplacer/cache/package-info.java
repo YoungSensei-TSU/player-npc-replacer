@@ -24,54 +24,32 @@
  */
 
 /**
- * <b>VENDORED CODE - do not edit by hand.</b>
+ * <b>VENDORED CODE - do not edit by hand.</b> Verbatim copies of RuneLite's
+ * {@code net.runelite:cache} module classes (only the {@code package}
+ * declaration changed), from {@code cache/src/main/java/net/runelite/cache/}
+ * in github.com/runelite/runelite: {@code io/InputStream}, {@code
+ * definitions/NpcDefinition}, {@code definitions/ItemDefinition}, {@code
+ * definitions/loaders/NpcLoader}, {@code definitions/loaders/ItemLoader},
+ * {@code EntityOpsDefinition}, {@code definitions/loaders/EntityOpsLoader}.
+ * Same BSD 2-Clause license; original copyright headers retained per-file.
  * <p>
- * Verbatim copies of RuneLite's own {@code net.runelite:cache} module classes,
- * with <i>only</i> the {@code package} declaration rewritten (and the now-
- * redundant same-package imports dropped). Sourced from the upstream RuneLite
- * repository (github.com/runelite/runelite), {@code
- * cache/src/main/java/net/runelite/cache/}:
- * <ul>
- * <li>{@code io/InputStream.java}</li>
- * <li>{@code definitions/NpcDefinition.java}, {@code definitions/ItemDefinition.java}</li>
- * <li>{@code definitions/loaders/NpcLoader.java}, {@code definitions/loaders/ItemLoader.java}</li>
- * <li>{@code EntityOpsDefinition.java}, {@code definitions/loaders/EntityOpsLoader.java}</li>
- * </ul>
- * Same BSD 2-Clause license as the originals; original copyright headers are
- * retained in each file.
+ * Vendored rather than depended on, to avoid an extra external dependency for
+ * seven small files. Used for DECODING ONLY: {@link
+ * com.sensei.playernpcreplacer.NpcCacheAnimationLookup}/{@link
+ * com.sensei.playernpcreplacer.ItemCacheModelLookup} fetch the raw
+ * definition bytes live via {@link net.runelite.api.Client#getIndexConfig()}
+ * + {@link net.runelite.api.IndexDataBase#loadData}, then hand them to these
+ * classes to parse in memory - nothing here touches disk, so the cache
+ * module's file-reading machinery ({@code Store}, {@code DiskStorage}) isn't
+ * vendored. They exist because {@link net.runelite.api.NPCComposition}
+ * exposes no animation fields and {@link net.runelite.api.ItemComposition}
+ * exposes no worn/equipped model fields.
  * <p>
- * <b>Why vendored instead of depended on:</b> this class pair
- * ({@code NpcCacheAnimationLookup}/{@code ItemCacheModelLookup}) was
- * originally developed and proven inside a full RuneLite client checkout,
- * where {@code net.runelite:cache} could not be added as a dependency of
- * {@code runelite-client}'s own build (verified live: removing an attempted
- * dependency line produced 10 "package net.runelite.cache does not exist"
- * errors, since that module isn't otherwise on the client's compile
- * classpath). Vendoring these specific decoder classes - rather than the
- * whole module - solved that with zero build-file changes, and was carried
- * over unchanged into this standalone repo rather than re-litigated, since it
- * demonstrably works and avoids taking on an extra external dependency
- * (and its own version-pinning/transitive-dependency surface) for six small,
- * self-contained files.
- * <p>
- * <b>What these are actually used for:</b> decoding ONLY. The raw definition
- * bytes come from the live client via
- * {@link net.runelite.api.Client#getIndexConfig()} +
- * {@link net.runelite.api.IndexDataBase#loadData}; these classes just parse
- * that {@code byte[]} in memory. Nothing here touches the disk - the cache
- * module's file-reading machinery ({@code Store}, {@code DiskStorage}, etc)
- * is deliberately NOT vendored, because this plugin never reads cache files.
- * They exist because the definition data this plugin needs is genuinely
- * absent from the public API: {@link net.runelite.api.NPCComposition} exposes
- * no animation fields, and {@link net.runelite.api.ItemComposition} exposes
- * no worn/equipped model fields (only {@code getInventoryModel()}).
- * <p>
- * <b>Maintenance caveat:</b> the definition formats change with game updates,
- * and upstream revises these loaders accordingly. If NPC animation lookups or
- * equipped-model lookups start returning wrong/garbage values after a game
- * update, re-copy these files from upstream rather than patching them here.
- * The decode is strictly sequential, so a single mis-handled opcode desyncs
- * the stream and silently yields plausible-looking but wrong ids.
+ * <b>Maintenance:</b> definition formats change with game updates. If
+ * lookups start returning wrong/garbage values, re-copy these files from
+ * upstream rather than patch them - the decode is strictly sequential, so one
+ * mis-handled opcode desyncs the stream and silently yields plausible-looking
+ * wrong ids.
  *
  * @see com.sensei.playernpcreplacer.NpcCacheAnimationLookup
  * @see com.sensei.playernpcreplacer.ItemCacheModelLookup
