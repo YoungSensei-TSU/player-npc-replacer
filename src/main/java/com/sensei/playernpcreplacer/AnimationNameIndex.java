@@ -35,6 +35,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import javax.annotation.Nullable;
 import javax.inject.Singleton;
 import lombok.extern.slf4j.Slf4j;
 
@@ -270,12 +271,56 @@ class AnimationNameIndex
 		// would otherwise get it RANKED as a legitimate action - the hard
 		// filter runs before ranking, which is exactly why that ordering
 		// matters.
-		"HIDE", "REVEAL", "BURROW", "EMERGE", "RISE", "SLEEP", "WAKE", "DIG"
+		"HIDE", "REVEAL", "BURROW", "EMERGE", "RISE", "SLEEP", "WAKE", "DIG",
+		// Quest/narrative interaction verbs: a scripted, ROLE-SPECIFIC action
+		// a quest npc performs as part of a cutscene or dialogue sequence, not
+		// a generic body pose - confirmed live by the user: Mother (the giant
+		// troll boss from My Arm's Big Adventure) shares her MYARM_TROLL_*
+		// family with Dad, the farming-tutorial troll from earlier in that
+		// same quest, so her family is full of entries like CRY, EATING,
+		// PICKING_HERBS, PLANTING_SEEDS, POURING_BUCKET, RECEIVING_VILE,
+		// BREAKING_RAKE, POKING_FARMING_PATCH and RAKING - none of which are
+		// remotely combat/skilling-appropriate, but none of which were
+		// excluded either, so a Mother override could end up miming farm
+		// chores instead of fighting.
+		//
+		// Unlike the positional/state-sequence category above, this one has
+		// no single unifying concept - it's inherently a grab-bag of
+		// arbitrary quest verbs, so treat future oddities of this SAME kind
+		// (an npc override occasionally performing an obviously
+		// narrative/cutscene action) as more entries to add here, not a sign
+		// this approach doesn't work. Verified each of these terms is a real,
+		// recurring segment elsewhere in AnimationID (not a one-off unique to
+		// this quest) and sampled its OTHER uses to confirm none collide with
+		// a legitimate combat animation: EATING (SITTING_EATING, racoon/sick-
+		// folk eating), PICKING (GARDEN_PICKING), BREAKING (object/seal/
+		// boulder breaking, never a weapon break), GIVE (dialogue item
+		// exchanges - GIVE_BEER, GIVES_CLOTHES, GIVE_COMPOST), VILE (a quest
+		// item container), CRY (crying emotes/dialogue).
+		"CRY", "EATING", "JUMPING", "PICKING", "PLANTING", "POURING",
+		"RECEIVING", "BREAKING", "RAKING", "POKING", "GIVE", "VILE",
+		// Dialogue-PORTRAIT animations, not world-model body poses at all -
+		// the same "wrong layer entirely" category as SPOT/SPOTANIM, and a
+		// real recurring one (~64 names). Spotted in Mother's own family
+		// (MY2ARM_TROLL_CHATHEAD_TALK_BASIC/_MUTE/_CRY/_TALK_SAD) once the
+		// prefix fix made her full family reachable.
+		"CHATHEAD"
 	};
 
 	// Only one keyword, but kept in the same form so isEmoteAnimation can use
 	// the shared per-segment matcher rather than a bare contains().
 	private static final String[] EMOTE_KEYWORDS = {"EMOTE"};
+
+	// The locomotion words an anchor animation can be named for, used ONLY by
+	// deriveFamilyPrefix to find where to cut - see its doc. Intentionally a
+	// separate list from EXCLUDED_KEYWORDS' locomotion entries even though
+	// they currently overlap: these two answer different questions ("where
+	// does this npc's name end?" vs "is this candidate unusable?"), and
+	// EXCLUDED_KEYWORDS gets terms added to it for unrelated reasons that
+	// must not start silently moving the prefix cut point.
+	private static final String[] LOCOMOTION_SEGMENTS = {
+		"WALK", "IDLE", "STAND", "RUN", "CRAWL", "ROTATE", "TURN"
+	};
 
 	// Resolved relative to this class, so it must live alongside the compiled
 	// class file - see build.gradle's resources handling and
@@ -381,16 +426,18 @@ class AnimationNameIndex
 		ensureBuilt();
 
 		final String anchorName = byId.get(anchorId);
-		final int lastSegment = anchorName == null ? -1 : anchorName.lastIndexOf('_');
-		if (lastSegment <= 0)
+		if (anchorName == null)
 		{
-			// No named constant for the anchor, or one with no "_SEGMENT" to
-			// strip (nothing to derive a shared-family prefix from) - can't
-			// confirm ANY candidate actually belongs to this npc's own
-			// animation family, so don't guess.
+			// No named constant for the anchor at all - nothing to derive a
+			// shared-family prefix from, so we can't confirm ANY candidate
+			// actually belongs to this npc's own animation family. Don't guess.
 			return Collections.emptyList();
 		}
-		final String prefix = anchorName.substring(0, lastSegment + 1); // keep the trailing '_'
+		final String prefix = deriveFamilyPrefix(anchorName);
+		if (prefix == null)
+		{
+			return Collections.emptyList();
+		}
 
 		final List<Integer> result = new ArrayList<>();
 		for (int id = anchorId - WINDOW_BEFORE; id <= anchorId + WINDOW_AFTER; id++)
@@ -411,6 +458,73 @@ class AnimationNameIndex
 			result.add(id);
 		}
 		return result;
+	}
+
+	/**
+	 * Derives the shared "this npc's own animation family" prefix from the
+	 * anchor's constant name, by cutting at the LOCOMOTION segment the anchor
+	 * is named for and discarding it plus everything after it.
+	 * <p>
+	 * This deliberately does NOT just strip the last {@code _SEGMENT}, which
+	 * is what it used to do. That worked only because every npc verified up to
+	 * that point happened to have an anchor ending in exactly one locomotion
+	 * word ({@code GODWARS_BANDOS_WALK} -> {@code GODWARS_BANDOS_}), and broke
+	 * silently the moment one didn't. Confirmed live by the user: Mother's
+	 * anchor is {@code MY2ARM_TROLL_WALKING_2X2} (a size qualifier AFTER the
+	 * locomotion word), which yielded {@code MY2ARM_TROLL_WALKING_} - so the
+	 * only candidates matching that prefix were her other {@code WALKING_*}
+	 * variants, every one of which {@link #EXCLUDED_KEYWORDS} then correctly
+	 * removed as locomotion, emptying the tier entirely and dropping her to
+	 * the generic human kick. Her real {@code MY2ARM_TROLL_ATTACK_MELEE}/
+	 * {@code ATTACK_RANGED} were never even considered, since they don't start
+	 * with {@code MY2ARM_TROLL_WALKING_}.
+	 * <p>
+	 * Not a one-off: ~586 {@code AnimationID} constants carry a qualifier
+	 * after their locomotion word ({@code TROLL_WALK_SHIELD}, {@code
+	 * HUMAN_WALK_F}, {@code GNOME_WALK_WITHBALL}...), so any npc anchored on
+	 * one of those was silently getting an over-narrow family.
+	 * <p>
+	 * Scans right-to-left for the locomotion segment on purpose, taking the
+	 * LAST match rather than the first: a name whose npc-identifying part
+	 * happens to itself begin with a locomotion word (a hypothetical {@code
+	 * SOMETHING_STANDARD_WALK} - {@code STANDARD} starts with {@code STAND})
+	 * would otherwise cut far too early and produce a dangerously broad
+	 * prefix, sweeping in unrelated npcs. Taking the last match keeps the cut
+	 * at the real locomotion word.
+	 *
+	 * @return the family prefix INCLUDING its trailing {@code '_'}, or {@code
+	 * null} if none could be derived (no locomotion segment found and no
+	 * strippable trailing segment, or the cut would leave nothing before it -
+	 * both meaning there's no way to confirm family membership, so the caller
+	 * returns no candidates rather than guessing).
+	 */
+	@Nullable
+	private static String deriveFamilyPrefix(String anchorName)
+	{
+		final String[] segments = anchorName.split("_");
+
+		// Index 0 is never a valid cut point - there'd be no npc-identifying
+		// part left in front of it to match a family on.
+		for (int i = segments.length - 1; i >= 1; i--)
+		{
+			if (matches(segments[i], LOCOMOTION_SEGMENTS))
+			{
+				final StringBuilder prefix = new StringBuilder();
+				for (int j = 0; j < i; j++)
+				{
+					prefix.append(segments[j]).append('_');
+				}
+				return prefix.toString();
+			}
+		}
+
+		// No locomotion segment found - the anchor is named for something
+		// else entirely (an idle with an unusual name, say). Fall back to the
+		// original "strip the last segment" behavior, which is still a
+		// reasonable guess at a family prefix and is what every npc verified
+		// before this method existed was already relying on.
+		final int lastSegment = anchorName.lastIndexOf('_');
+		return lastSegment <= 0 ? null : anchorName.substring(0, lastSegment + 1);
 	}
 
 	/**
