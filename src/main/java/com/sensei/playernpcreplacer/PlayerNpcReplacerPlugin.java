@@ -662,6 +662,64 @@ public class PlayerNpcReplacerPlugin extends Plugin
 		// entry in activeClones was.
 		teardownSelfClone();
 		modelCache.clear();
+
+		// Revert every PLAYER this plugin actually mutated, back to their real
+		// appearance and animations.
+		//
+		// The two override kinds need very different cleanup, and only one of
+		// them was previously handled here. An NPC override is purely
+		// additive - a synthetic RuneLiteObject clone plus the render callback
+		// hiding the real npc - so tearing down the clones above and
+		// unregistering the callback fully restores it; the real npc entity
+		// was never touched. A PLAYER override is the opposite: it MUTATES the
+		// real player entity in place (setTransformedNpcId, their whole
+		// locomotion animation set, their equipment array, and the action-layer
+		// animation). None of that is undone by removing the render callback,
+		// so without this a disabled plugin left players still looking AND
+		// animating like npcs until something unrelated happened to rebuild
+		// their composition.
+		//
+		// Driven off capturedPlayerAnimations rather than playerOverrides: that
+		// map's keys are exactly the players replace() actually applied the
+		// transform path to, which is the precise set needing an undo - a
+		// player with an override who was never present (or who is shown via
+		// the self-clone path, already handled above) has nothing to revert.
+		// It's also the same map revertTransformOnly itself guards on.
+		//
+		// clientThread.invoke because this touches live Actor/PlayerComposition
+		// state - it runs inline when shutDown is already on the client thread,
+		// and queues correctly if not, matching how renderCallbackManager is
+		// unregistered just above.
+		clientThread.invoke(() ->
+		{
+			// Copied first: revertTransformOnly removes its own entry from
+			// capturedPlayerAnimations as it goes, which would otherwise be a
+			// concurrent modification of the very keySet being iterated.
+			for (String name : new ArrayList<>(capturedPlayerAnimations.keySet()))
+			{
+				final Player player = findPresentPlayer(name);
+				if (player != null)
+				{
+					revertTransformOnly(player);
+				}
+			}
+
+			// Anything still here belongs to a player who wasn't present to
+			// revert, so there's no live entity left holding the mutation -
+			// drop the stale captures rather than leak them into a later
+			// re-enable, where they'd be mistaken for that player's real
+			// original values.
+			capturedPlayerAnimations.clear();
+			capturedPlayerEquipmentIds.clear();
+			// Session-only animation bookkeeping - meaningless without the
+			// overrides they describe, and actively wrong to carry across a
+			// re-enable (a stale "this is our own substitute" entry would make
+			// onClientTick skip recomputing a genuinely new animation).
+			lastPlayerActionSubstituteId.clear();
+			pendingIdleAfterSwitch.clear();
+			recentlyHitUntilTick.clear();
+		});
+
 		// npcOverrides/playerOverrides intentionally kept in memory (though
 		// harmless either way, since startUp reloads them from config) - the
 		// persisted mappings are what need to survive, and they already do via
