@@ -64,8 +64,16 @@ import net.runelite.client.ui.PluginPanel;
 import net.runelite.client.ui.components.IconTextField;
 
 /**
- * The plugin's side panel. A collapsible "Overwritten NPCs" section (collapsed
- * by default, since it's a secondary management view) sits above everything
+ * The plugin's side panel. Nearly every section is collapsible via {@link
+ * CollapsibleSection} - the panel is long enough that being able to fold away
+ * the parts you aren't using is what keeps it navigable. The two override
+ * lists start COLLAPSED (secondary management views you dip into); Active
+ * NPCs, Browse/search and Bulk player tools start EXPANDED, since those are
+ * the actual working controls and opening to a fully-folded panel would hide
+ * everything the plugin does. "Special operations" is the one plain,
+ * always-visible section - it's just three small controls.
+ * <p>
+ * The collapsible "Overwritten NPCs" section sits above everything
  * else: it lists every currently-persisted NPC replacement with a per-entry
  * hover-highlight checkbox and a remove button, so a replacement doesn't have to
  * be manually re-found in-game just to toggle its highlight or undo it. Below
@@ -126,6 +134,14 @@ import net.runelite.client.ui.components.IconTextField;
  * PlayerOverride#showEquipment}, which the "Overwritten Players" list also
  * exposes per-row (E/H, only for the local player's own row - see {@link
  * OverridePlayerCellRenderer}).
+ * <p>
+ * Last is "Special operations", which unlike everything above is not a
+ * one-shot action at all - it configures a standing rule that the PLUGIN
+ * applies on its own, to players as they render into view (see {@code
+ * PlayerNpcReplacerPlugin#maybeAutoApplyOverride}). Because those two controls
+ * are persisted settings rather than transient panel state, they're
+ * initialized from the plugin and write straight back to it; the panel holds
+ * no copy of its own.
  */
 class PlayerNpcReplacerPanel extends PluginPanel
 {
@@ -135,6 +151,8 @@ class PlayerNpcReplacerPanel extends PluginPanel
 	private static final String ANY_BODY = "All body types";
 	private static final String ANIMATIONS_PLAYING = "Animations: Playing";
 	private static final String ANIMATIONS_PAUSED = "Animations: Paused";
+	private static final String AUTO_ANIMATIONS_PLAY = "Play";
+	private static final String AUTO_ANIMATIONS_PAUSED = "Paused";
 	private static final int ROW_HEIGHT = 26;
 	private static final int CONTROL_ZONE_WIDTH = 20;
 
@@ -179,10 +197,9 @@ class PlayerNpcReplacerPanel extends PluginPanel
 		}
 	};
 	private final JLabel overridesEmptyLabel = new JLabel("None yet - shift-right-click an NPC in-game and pick Replace.");
-	private final JLabel overridesArrow = new JLabel();
-	private final JLabel overridesHeaderText = new JLabel();
-	private final JPanel overridesContent = new JPanel();
-	private boolean overridesExpanded = false;
+	// Title is set live by refreshOverridesList (it carries a count), so the
+	// constructor text here is only what shows before the first refresh.
+	private final CollapsibleSection overridesSection = new CollapsibleSection("Overwritten NPCs");
 
 	private final DefaultListModel<PlayerOverride> playerOverridesModel = new DefaultListModel<>();
 
@@ -225,10 +242,13 @@ class PlayerNpcReplacerPanel extends PluginPanel
 		}
 	};
 	private final JLabel playerOverridesEmptyLabel = new JLabel("None yet - shift-right-click a player in-game and pick Replace.");
-	private final JLabel playerOverridesArrow = new JLabel();
-	private final JLabel playerOverridesHeaderText = new JLabel();
-	private final JPanel playerOverridesContent = new JPanel();
-	private boolean playerOverridesExpanded = false;
+	private final CollapsibleSection playerOverridesSection = new CollapsibleSection("Overwritten Players");
+
+	// The three sections below carry no live count, so their titles are final.
+	private final CollapsibleSection activeSection =
+		new CollapsibleSection("Active NPCs (top = Replace-quick default; all shown in the in-game Replace menu)");
+	private final CollapsibleSection browseSection = new CollapsibleSection("Browse / search all NPCs");
+	private final CollapsibleSection bulkToolsSection = new CollapsibleSection("Bulk player tools (players only, not npcs)");
 
 	private final DefaultListModel<NpcChoice> activeModel = new DefaultListModel<>();
 	private final JList<NpcChoice> activeList = new HScrollableJList<>(activeModel);
@@ -238,6 +258,9 @@ class PlayerNpcReplacerPanel extends PluginPanel
 	private final JComboBox<String> typeFilter = new JComboBox<>();
 	private final JComboBox<String> sizeFilter = new JComboBox<>();
 	private final JComboBox<String> bodyFilter = new JComboBox<>();
+	// Opt-in, because for the overwhelming majority of npcs it changes nothing
+	// (one name, one model) and the extra id-suffixed rows would just be noise.
+	private final JCheckBox modelVariantsCheckbox = new JCheckBox("Show same-name model variants");
 	private final DefaultListModel<NpcChoice> resultsModel = new DefaultListModel<>();
 	private final JList<NpcChoice> resultsList = new HScrollableJList<>(resultsModel);
 
@@ -267,6 +290,19 @@ class PlayerNpcReplacerPanel extends PluginPanel
 	// selection rather than a second NPC picker.
 	private final JCheckBox selfShowEquipmentCheckbox = new JCheckBox("Show my own equipment (experimental)");
 	private final JButton selfApplyButton = new JButton("Apply to yourself (uses NPC selected above)");
+
+	// Special operations - automatic overrides for players who render into
+	// view, driven entirely by plugin-side state (see
+	// PlayerNpcReplacerPlugin#maybeAutoApplyOverride) rather than anything the
+	// panel tracks itself. Both controls are initialized FROM the plugin in the
+	// constructor, since the settings are persisted and so outlive the panel.
+	private final JComboBox<AutoOverrideMode> autoOverrideModeCombo = new JComboBox<>(AutoOverrideMode.values());
+	// Plain Play/Paused wording rather than the bulk tools' "Animations:
+	// Playing/Paused" - this one sits under its own "NPC animations:" label,
+	// so repeating the word in every entry would just be redundant.
+	private final JComboBox<String> autoOverrideAnimationsCombo =
+		new JComboBox<>(new String[]{AUTO_ANIMATIONS_PLAY, AUTO_ANIMATIONS_PAUSED});
+	private final JCheckBox autoOverrideOnlyNewlySeenCheckbox = new JCheckBox("Only affect newly seen players");
 
 	private boolean indexBuilt = false;
 
@@ -305,39 +341,8 @@ class PlayerNpcReplacerPanel extends PluginPanel
 		overridesScroll.setMaximumSize(new Dimension(PluginPanel.PANEL_WIDTH, 140));
 		overridesScroll.setAlignmentX(LEFT_ALIGNMENT);
 
-		overridesContent.setLayout(new BoxLayout(overridesContent, BoxLayout.Y_AXIS));
-		overridesContent.setBackground(ColorScheme.DARK_GRAY_COLOR);
-		overridesContent.setAlignmentX(LEFT_ALIGNMENT);
-		overridesContent.add(overridesEmptyLabel);
-		overridesContent.add(overridesScroll);
-
-		overridesArrow.setForeground(Color.WHITE);
-		overridesArrow.setFont(FontManager.getRunescapeBoldFont().deriveFont(10f));
-		overridesArrow.setBorder(new EmptyBorder(0, 0, 0, 4));
-
-		overridesHeaderText.setForeground(Color.WHITE);
-		overridesHeaderText.setFont(FontManager.getRunescapeBoldFont().deriveFont(12f));
-
-		final JPanel overridesHeaderLabels = new JPanel(new BorderLayout());
-		overridesHeaderLabels.setOpaque(false);
-		overridesHeaderLabels.add(overridesArrow, BorderLayout.WEST);
-		overridesHeaderLabels.add(overridesHeaderText, BorderLayout.CENTER);
-
-		final JPanel overridesHeaderRow = new JPanel(new BorderLayout());
-		overridesHeaderRow.setBackground(ColorScheme.DARK_GRAY_COLOR);
-		overridesHeaderRow.setBorder(new EmptyBorder(8, 0, 4, 0));
-		overridesHeaderRow.setMaximumSize(new Dimension(PluginPanel.PANEL_WIDTH, 22));
-		overridesHeaderRow.setAlignmentX(LEFT_ALIGNMENT);
-		overridesHeaderRow.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
-		overridesHeaderRow.add(overridesHeaderLabels, BorderLayout.WEST);
-		overridesHeaderRow.addMouseListener(new MouseAdapter()
-		{
-			@Override
-			public void mouseClicked(MouseEvent e)
-			{
-				setOverridesExpanded(!overridesExpanded);
-			}
-		});
+		overridesSection.add(overridesEmptyLabel);
+		overridesSection.add(overridesScroll);
 
 		playerOverridesList.setBackground(ColorScheme.DARK_GRAY_COLOR);
 		playerOverridesList.setFixedCellHeight(ROW_HEIGHT);
@@ -363,39 +368,8 @@ class PlayerNpcReplacerPanel extends PluginPanel
 		playerOverridesScroll.setMaximumSize(new Dimension(PluginPanel.PANEL_WIDTH, 140));
 		playerOverridesScroll.setAlignmentX(LEFT_ALIGNMENT);
 
-		playerOverridesContent.setLayout(new BoxLayout(playerOverridesContent, BoxLayout.Y_AXIS));
-		playerOverridesContent.setBackground(ColorScheme.DARK_GRAY_COLOR);
-		playerOverridesContent.setAlignmentX(LEFT_ALIGNMENT);
-		playerOverridesContent.add(playerOverridesEmptyLabel);
-		playerOverridesContent.add(playerOverridesScroll);
-
-		playerOverridesArrow.setForeground(Color.WHITE);
-		playerOverridesArrow.setFont(FontManager.getRunescapeBoldFont().deriveFont(10f));
-		playerOverridesArrow.setBorder(new EmptyBorder(0, 0, 0, 4));
-
-		playerOverridesHeaderText.setForeground(Color.WHITE);
-		playerOverridesHeaderText.setFont(FontManager.getRunescapeBoldFont().deriveFont(12f));
-
-		final JPanel playerOverridesHeaderLabels = new JPanel(new BorderLayout());
-		playerOverridesHeaderLabels.setOpaque(false);
-		playerOverridesHeaderLabels.add(playerOverridesArrow, BorderLayout.WEST);
-		playerOverridesHeaderLabels.add(playerOverridesHeaderText, BorderLayout.CENTER);
-
-		final JPanel playerOverridesHeaderRow = new JPanel(new BorderLayout());
-		playerOverridesHeaderRow.setBackground(ColorScheme.DARK_GRAY_COLOR);
-		playerOverridesHeaderRow.setBorder(new EmptyBorder(8, 0, 4, 0));
-		playerOverridesHeaderRow.setMaximumSize(new Dimension(PluginPanel.PANEL_WIDTH, 22));
-		playerOverridesHeaderRow.setAlignmentX(LEFT_ALIGNMENT);
-		playerOverridesHeaderRow.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
-		playerOverridesHeaderRow.add(playerOverridesHeaderLabels, BorderLayout.WEST);
-		playerOverridesHeaderRow.addMouseListener(new MouseAdapter()
-		{
-			@Override
-			public void mouseClicked(MouseEvent e)
-			{
-				setPlayerOverridesExpanded(!playerOverridesExpanded);
-			}
-		});
+		playerOverridesSection.add(playerOverridesEmptyLabel);
+		playerOverridesSection.add(playerOverridesScroll);
 
 		activeList.setBackground(ColorScheme.DARK_GRAY_COLOR);
 		activeList.setFixedCellHeight(ROW_HEIGHT);
@@ -456,6 +430,16 @@ class PlayerNpcReplacerPanel extends PluginPanel
 		bodyFilter.addItem(NpcIndex.BODY_NON_HUMAN);
 		bodyFilter.addActionListener(e -> updateResults());
 
+		modelVariantsCheckbox.setForeground(Color.LIGHT_GRAY);
+		modelVariantsCheckbox.setFont(FontManager.getRunescapeSmallFont());
+		modelVariantsCheckbox.setOpaque(false);
+		modelVariantsCheckbox.setAlignmentX(LEFT_ALIGNMENT);
+		modelVariantsCheckbox.setToolTipText("<html>Some NPCs ship several different-looking models under one "
+			+ "name - Enakhra's fight phases, for example.<br>Check this to list each of those separately. "
+			+ "Where a name is shared, the NPC id is appended so you can tell them apart.<br>"
+			+ "NPCs that merely share a name but look identical are still collapsed either way.</html>");
+		modelVariantsCheckbox.addActionListener(e -> updateResults());
+
 		// GridLayout, not BorderLayout - three combos now, and BorderLayout only
 		// has one slot per compass direction (CENTER/EAST was enough for two).
 		final JPanel filters = new JPanel(new GridLayout(1, 3, 4, 0));
@@ -514,9 +498,6 @@ class PlayerNpcReplacerPanel extends PluginPanel
 
 		replaceRandomButton.setAlignmentX(LEFT_ALIGNMENT);
 		replaceRandomButton.addActionListener(e -> randomizeActiveNpcs(true));
-
-		final JLabel bulkToolsHeader = section("Bulk player tools (players only, not npcs)");
-		bulkToolsHeader.setAlignmentX(LEFT_ALIGNMENT);
 
 		final JLabel bulkToolsDescription = new JLabel("Affects other players within range of you.");
 		bulkToolsDescription.setForeground(Color.GRAY);
@@ -602,58 +583,139 @@ class PlayerNpcReplacerPanel extends PluginPanel
 		selfToolsHeader.setAlignmentX(LEFT_ALIGNMENT);
 		selfToolsHeader.setBorder(new EmptyBorder(6, 0, 0, 0));
 
-		final JLabel activeHeader = section("Active NPCs (top = Replace-quick default; all shown in the in-game Replace menu)");
-		final JLabel browseHeader = section("Browse / search all NPCs");
-		activeHeader.setAlignmentX(LEFT_ALIGNMENT);
-		browseHeader.setAlignmentX(LEFT_ALIGNMENT);
+		final JLabel specialOpsHeader = section("Special operations");
+		specialOpsHeader.setAlignmentX(LEFT_ALIGNMENT);
+
+		final JLabel specialOpsDescription = new JLabel("<html>Automatically override players as they "
+			+ "render into view, using the Active NPCs list above.</html>");
+		specialOpsDescription.setForeground(Color.GRAY);
+		specialOpsDescription.setFont(FontManager.getRunescapeSmallFont());
+		specialOpsDescription.setAlignmentX(LEFT_ALIGNMENT);
+
+		final JLabel autoOverrideModeLabel = new JLabel("Auto-override new players:");
+		autoOverrideModeLabel.setForeground(Color.GRAY);
+		autoOverrideModeLabel.setFont(FontManager.getRunescapeSmallFont());
+		autoOverrideModeLabel.setAlignmentX(LEFT_ALIGNMENT);
+		autoOverrideModeLabel.setBorder(new EmptyBorder(6, 0, 0, 0));
+
+		// Initialized from the plugin (the persisted source of truth) BEFORE
+		// the listener is attached, so restoring the saved value doesn't fire
+		// a change event that redundantly re-persists it - and, more
+		// importantly, doesn't trip setAutoOverrideMode's "turning on"
+		// re-seed as a side effect of merely opening the panel.
+		autoOverrideModeCombo.setSelectedItem(plugin.getAutoOverrideMode());
+		autoOverrideModeCombo.setMaximumSize(new Dimension(PluginPanel.PANEL_WIDTH, 26));
+		autoOverrideModeCombo.setAlignmentX(LEFT_ALIGNMENT);
+		autoOverrideModeCombo.addActionListener(e ->
+		{
+			final AutoOverrideMode mode = (AutoOverrideMode) autoOverrideModeCombo.getSelectedItem();
+			if (mode != null)
+			{
+				plugin.setAutoOverrideMode(mode);
+			}
+		});
+
+		final JLabel autoOverrideAnimationsLabel = new JLabel("NPC animations:");
+		autoOverrideAnimationsLabel.setForeground(Color.GRAY);
+		autoOverrideAnimationsLabel.setFont(FontManager.getRunescapeSmallFont());
+		autoOverrideAnimationsLabel.setAlignmentX(LEFT_ALIGNMENT);
+		autoOverrideAnimationsLabel.setBorder(new EmptyBorder(6, 0, 0, 0));
+
+		// Same initialize-before-listener ordering as the mode combo above, so
+		// restoring the persisted value doesn't fire a redundant write back.
+		autoOverrideAnimationsCombo.setSelectedItem(
+			plugin.isAutoOverrideAnimationsDisabled() ? AUTO_ANIMATIONS_PAUSED : AUTO_ANIMATIONS_PLAY);
+		autoOverrideAnimationsCombo.setMaximumSize(new Dimension(PluginPanel.PANEL_WIDTH, 26));
+		autoOverrideAnimationsCombo.setAlignmentX(LEFT_ALIGNMENT);
+		autoOverrideAnimationsCombo.setToolTipText("<html><b>Play</b> - the replacement NPC uses its own "
+			+ "animations.<br><b>Paused</b> - the NPC model shows the player's real animations instead.<br>"
+			+ "Applies to overrides assigned from now on; existing ones keep what they were given, and each "
+			+ "row in \"Overwritten Players\" can still be toggled individually.</html>");
+		autoOverrideAnimationsCombo.addActionListener(e ->
+			plugin.setAutoOverrideAnimationsDisabled(
+				AUTO_ANIMATIONS_PAUSED.equals(autoOverrideAnimationsCombo.getSelectedItem())));
+
+		autoOverrideOnlyNewlySeenCheckbox.setSelected(plugin.isAutoOverrideOnlyNewlySeen());
+		autoOverrideOnlyNewlySeenCheckbox.setForeground(Color.LIGHT_GRAY);
+		autoOverrideOnlyNewlySeenCheckbox.setFont(FontManager.getRunescapeSmallFont());
+		autoOverrideOnlyNewlySeenCheckbox.setOpaque(false);
+		autoOverrideOnlyNewlySeenCheckbox.setAlignmentX(LEFT_ALIGNMENT);
+		autoOverrideOnlyNewlySeenCheckbox.setToolTipText("<html>When checked, players already rendered when "
+			+ "you enable this are never auto-overridden - even if they walk out of view and back in.<br>"
+			+ "Only players you have not seen yet this session get one.</html>");
+		autoOverrideOnlyNewlySeenCheckbox.addActionListener(e ->
+			plugin.setAutoOverrideOnlyNewlySeen(autoOverrideOnlyNewlySeenCheckbox.isSelected()));
+
 		searchBar.setAlignmentX(LEFT_ALIGNMENT);
 		activeEmptyLabel.setAlignmentX(LEFT_ALIGNMENT);
 
-		add(overridesHeaderRow);
-		add(overridesContent);
+		activeSection.add(activeEmptyLabel);
+		activeSection.add(activeScroll);
+
+		// Randomize belongs to Browse/search rather than being its own section:
+		// it draws its candidate pool from the type/body/size filters directly
+		// above it, so collapsing the search away would leave a control whose
+		// inputs are hidden.
+		browseSection.add(searchBar);
+		browseSection.add(Box.createVerticalStrut(4));
+		browseSection.add(filters);
+		browseSection.add(modelVariantsCheckbox);
+		browseSection.add(statusLabel);
+		browseSection.add(resultsScroll);
+		browseSection.add(randomHeader);
+		browseSection.add(randomQuantityRow);
+		browseSection.add(Box.createVerticalStrut(4));
+		browseSection.add(addRandomButton);
+		browseSection.add(replaceRandomButton);
+
+		bulkToolsSection.add(bulkToolsDescription);
+		bulkToolsSection.add(Box.createVerticalStrut(4));
+		bulkToolsSection.add(radiusRow);
+		bulkToolsSection.add(Box.createVerticalStrut(4));
+		bulkToolsSection.add(bulkNpcCombo);
+		bulkToolsSection.add(bulkAnimationsStateCombo);
+		bulkToolsSection.add(bulkApplyButton);
+		bulkToolsSection.add(bulkRandomizeButton);
+		bulkToolsSection.add(skipExistingCheckbox);
+		bulkToolsSection.add(selfToolsHeader);
+		bulkToolsSection.add(selfShowEquipmentCheckbox);
+		bulkToolsSection.add(selfApplyButton);
+		bulkToolsSection.add(Box.createVerticalStrut(4));
+		bulkToolsSection.add(bulkClearRadiusButton);
+		bulkToolsSection.add(bulkClearOutsideRadiusButton);
+		bulkToolsSection.add(Box.createVerticalStrut(4));
+		bulkToolsSection.add(bulkClearAllButton);
+
+		overridesSection.addTo(this);
 		add(Box.createVerticalStrut(4));
-		add(playerOverridesHeaderRow);
-		add(playerOverridesContent);
+		playerOverridesSection.addTo(this);
 		add(Box.createVerticalStrut(4));
-		add(activeHeader);
-		add(activeEmptyLabel);
-		add(activeScroll);
-		add(Box.createVerticalStrut(10));
-		add(browseHeader);
-		add(searchBar);
+		activeSection.addTo(this);
 		add(Box.createVerticalStrut(4));
-		add(filters);
-		add(statusLabel);
-		add(resultsScroll);
-		add(randomHeader);
-		add(randomQuantityRow);
+		browseSection.addTo(this);
 		add(Box.createVerticalStrut(4));
-		add(addRandomButton);
-		add(replaceRandomButton);
-		add(bulkToolsHeader);
-		add(bulkToolsDescription);
-		add(Box.createVerticalStrut(4));
-		add(radiusRow);
-		add(Box.createVerticalStrut(4));
-		add(bulkNpcCombo);
-		add(bulkAnimationsStateCombo);
-		add(bulkApplyButton);
-		add(bulkRandomizeButton);
-		add(skipExistingCheckbox);
-		add(selfToolsHeader);
-		add(selfShowEquipmentCheckbox);
-		add(selfApplyButton);
-		add(Box.createVerticalStrut(4));
-		add(bulkClearRadiusButton);
-		add(bulkClearOutsideRadiusButton);
-		add(Box.createVerticalStrut(4));
-		add(bulkClearAllButton);
+		bulkToolsSection.addTo(this);
+		add(specialOpsHeader);
+		add(specialOpsDescription);
+		add(autoOverrideModeLabel);
+		add(autoOverrideModeCombo);
+		add(autoOverrideAnimationsLabel);
+		add(autoOverrideAnimationsCombo);
+		add(autoOverrideOnlyNewlySeenCheckbox);
 
 		refreshActiveList();
 		refreshOverridesList();
 		refreshPlayerOverridesList();
-		setOverridesExpanded(false);
-		setPlayerOverridesExpanded(false);
+		overridesSection.setExpanded(false);
+		playerOverridesSection.setExpanded(false);
+		// The three new sections start EXPANDED, unlike the two override lists
+		// above them: those are reference/status lists you dip into
+		// occasionally, whereas these are the panel's actual working controls -
+		// opening to a fully collapsed panel would hide everything the plugin
+		// does behind five clicks.
+		activeSection.setExpanded(true);
+		browseSection.setExpanded(true);
+		bulkToolsSection.setExpanded(true);
 	}
 
 	@Override
@@ -700,6 +762,93 @@ class PlayerNpcReplacerPanel extends PluginPanel
 		return label;
 	}
 
+	/**
+	 * A click-to-toggle section header plus the content it shows and hides -
+	 * the panel's one collapsible-section implementation, used by every such
+	 * section here.
+	 * <p>
+	 * Deliberately an INNER (non-static) class: {@link #setExpanded} has to
+	 * revalidate the panel the section was added to, not the section itself,
+	 * because hiding a child is what forces the outer {@code BoxLayout} to
+	 * reflow everything below it. Being an inner class means {@code
+	 * revalidate()}/{@code repaint()} resolve to the enclosing panel's for
+	 * free, with nothing to wire up per section.
+	 * <p>
+	 * Add content with {@link #add}, never straight to the panel - a component
+	 * added to the panel instead of to {@link #content} simply won't collapse
+	 * with the rest of its section.
+	 */
+	private final class CollapsibleSection
+	{
+		private final JLabel arrow = new JLabel();
+		private final JLabel title = new JLabel();
+		private final JPanel headerRow = new JPanel(new BorderLayout());
+		private final JPanel content = new JPanel();
+		private boolean expanded;
+
+		CollapsibleSection(String titleText)
+		{
+			arrow.setForeground(Color.WHITE);
+			arrow.setFont(FontManager.getRunescapeBoldFont().deriveFont(10f));
+			arrow.setBorder(new EmptyBorder(0, 0, 0, 4));
+
+			title.setText(titleText);
+			title.setForeground(Color.WHITE);
+			title.setFont(FontManager.getRunescapeBoldFont().deriveFont(12f));
+
+			final JPanel headerLabels = new JPanel(new BorderLayout());
+			headerLabels.setOpaque(false);
+			headerLabels.add(arrow, BorderLayout.WEST);
+			headerLabels.add(title, BorderLayout.CENTER);
+
+			headerRow.setBackground(ColorScheme.DARK_GRAY_COLOR);
+			headerRow.setBorder(new EmptyBorder(8, 0, 4, 0));
+			headerRow.setMaximumSize(new Dimension(PluginPanel.PANEL_WIDTH, 22));
+			headerRow.setAlignmentX(LEFT_ALIGNMENT);
+			headerRow.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+			headerRow.add(headerLabels, BorderLayout.WEST);
+			headerRow.addMouseListener(new MouseAdapter()
+			{
+				@Override
+				public void mouseClicked(MouseEvent e)
+				{
+					setExpanded(!expanded);
+				}
+			});
+
+			content.setLayout(new BoxLayout(content, BoxLayout.Y_AXIS));
+			content.setBackground(ColorScheme.DARK_GRAY_COLOR);
+			content.setAlignmentX(LEFT_ALIGNMENT);
+		}
+
+		void setExpanded(boolean expanded)
+		{
+			this.expanded = expanded;
+			arrow.setText(expanded ? "▼" : "▶");
+			content.setVisible(expanded);
+			revalidate();
+			repaint();
+		}
+
+		/** For sections whose header carries a live count (e.g. "Overwritten NPCs (3)"). */
+		void setTitle(String text)
+		{
+			title.setText(text);
+		}
+
+		void add(Component component)
+		{
+			content.add(component);
+		}
+
+		/** Adds this section's header and content to the panel, in that order. */
+		void addTo(JPanel parent)
+		{
+			parent.add(headerRow);
+			parent.add(content);
+		}
+	}
+
 	private void updateResults()
 	{
 		resultsModel.clear();
@@ -710,7 +859,8 @@ class PlayerNpcReplacerPanel extends PluginPanel
 		}
 
 		final List<NpcChoice> results = npcIndex.search(searchBar.getText(),
-			selectedSizeFilter(), selectedTypeFilter(), selectedBodyFilter(), MAX_RESULTS);
+			selectedSizeFilter(), selectedTypeFilter(), selectedBodyFilter(),
+			modelVariantsCheckbox.isSelected(), MAX_RESULTS);
 		for (NpcChoice choice : results)
 		{
 			resultsModel.addElement(choice);
@@ -758,8 +908,13 @@ class PlayerNpcReplacerPanel extends PluginPanel
 			return;
 		}
 
+		// Integer.MAX_VALUE, not npcIndex.size(): this wants EVERYTHING matching
+		// the current filters as its shuffle pool, and with model variants
+		// enabled the searchable set is larger than the one-per-name count
+		// size() reports - passing that would silently truncate the pool.
 		final List<NpcChoice> pool = new ArrayList<>(
-			npcIndex.search("", selectedSizeFilter(), selectedTypeFilter(), selectedBodyFilter(), npcIndex.size()));
+			npcIndex.search("", selectedSizeFilter(), selectedTypeFilter(), selectedBodyFilter(),
+				modelVariantsCheckbox.isSelected(), Integer.MAX_VALUE));
 		if (pool.isEmpty())
 		{
 			return;
@@ -863,15 +1018,6 @@ class PlayerNpcReplacerPanel extends PluginPanel
 		refreshActiveList();
 	}
 
-	private void setOverridesExpanded(boolean expanded)
-	{
-		overridesExpanded = expanded;
-		overridesArrow.setText(expanded ? "▼" : "▶");
-		overridesContent.setVisible(expanded);
-		revalidate();
-		repaint();
-	}
-
 	void refreshOverridesList()
 	{
 		final List<NpcOverride> overrides = plugin.getNpcOverrides();
@@ -884,7 +1030,7 @@ class PlayerNpcReplacerPanel extends PluginPanel
 
 		overridesEmptyLabel.setVisible(overrides.isEmpty());
 		overridesList.setVisible(!overrides.isEmpty());
-		overridesHeaderText.setText("Overwritten NPCs (" + overrides.size() + ")");
+		overridesSection.setTitle("Overwritten NPCs (" + overrides.size() + ")");
 	}
 
 	/**
@@ -934,15 +1080,6 @@ class PlayerNpcReplacerPanel extends PluginPanel
 		}
 	}
 
-	private void setPlayerOverridesExpanded(boolean expanded)
-	{
-		playerOverridesExpanded = expanded;
-		playerOverridesArrow.setText(expanded ? "▼" : "▶");
-		playerOverridesContent.setVisible(expanded);
-		revalidate();
-		repaint();
-	}
-
 	void refreshPlayerOverridesList()
 	{
 		final List<PlayerOverride> overrides = plugin.getPlayerOverrides();
@@ -955,7 +1092,7 @@ class PlayerNpcReplacerPanel extends PluginPanel
 
 		playerOverridesEmptyLabel.setVisible(overrides.isEmpty());
 		playerOverridesList.setVisible(!overrides.isEmpty());
-		playerOverridesHeaderText.setText("Overwritten Players (" + overrides.size() + ")");
+		playerOverridesSection.setTitle("Overwritten Players (" + overrides.size() + ")");
 	}
 
 	/**

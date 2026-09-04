@@ -248,6 +248,9 @@ public class PlayerNpcReplacerPlugin extends Plugin
 	private static final String NPC_OVERRIDES_KEY = "npcOverrides";
 	private static final String PLAYER_OVERRIDES_KEY = "playerOverrides";
 	private static final String NPC_ANIMATION_SETS_KEY = "npcAnimationSets";
+	private static final String AUTO_OVERRIDE_MODE_KEY = "autoOverrideMode";
+	private static final String AUTO_OVERRIDE_ONLY_NEWLY_SEEN_KEY = "autoOverrideOnlyNewlySeen";
+	private static final String AUTO_OVERRIDE_ANIMATIONS_DISABLED_KEY = "autoOverrideAnimationsDisabled";
 	private static final Type ACTIVE_NPCS_TYPE = new TypeToken<List<NpcChoice>>()
 	{
 	}.getType();
@@ -430,6 +433,42 @@ public class PlayerNpcReplacerPlugin extends Plugin
 	// is a live view over an array-backed pool the client reuses every tick (same
 	// caveat as Player), so this is only ever touched within a single spawn-to-
 	// despawn lifetime; onNpcDespawned removes the entry the moment that ends.
+	// "Special operations" auto-override settings - persisted, since they're
+	// user intent rather than derived state. See maybeAutoApplyOverride.
+	private AutoOverrideMode autoOverrideMode = AutoOverrideMode.OFF;
+	private boolean autoOverrideOnlyNewlySeen = true;
+
+	// Which animation set an auto-applied override uses: false (the default)
+	// plays the REPLACEMENT NPC's own animations, true "pauses" them so the
+	// player's real animations show on the npc model instead. Same meaning as
+	// PlayerOverride#animationsDisabled everywhere else - named for the field
+	// it feeds rather than for the panel's Play/Paused wording, since that's
+	// what a reader following this value ends up looking at.
+	private boolean autoOverrideAnimationsDisabled;
+
+	// SESSION-ONLY rotation position for AutoOverrideMode.ORDERED - see that
+	// constant's own doc for why this deliberately isn't persisted. Only ever
+	// read through Math.floorMod against the CURRENT activeNpcs size, so it
+	// stays valid even when the list is reordered or shrinks underneath it,
+	// and stays correct if it ever overflows to negative.
+	private int autoOverrideOrderedIndex;
+
+	// SESSION-ONLY: every player name observed since this plugin started,
+	// which is what "newly seen" is judged against when
+	// autoOverrideOnlyNewlySeen is set. Seeded with everyone already rendered
+	// at startup (and again whenever auto-override is switched on), then added
+	// to on every spawn - so a player who was already in view, or who has been
+	// seen once and later walks out and back in, is never treated as new
+	// again. Not persisted: "already in your render view" is inherently about
+	// the current session, and persisting it would permanently exclude
+	// everyone ever seen.
+	private final Set<String> seenPlayerNames = new HashSet<>();
+
+	// Only used for AutoOverrideMode.RANDOM. Held as a field rather than
+	// constructed per-assignment so consecutive auto-applies don't risk
+	// repeating a seeded-from-clock sequence.
+	private final Random autoOverrideRandom = new Random();
+
 	private final Map<NPC, NpcClone> activeClones = new HashMap<>();
 
 	// SESSION-ONLY: the local player's own PlayerOverride#showEquipment
@@ -622,6 +661,20 @@ public class PlayerNpcReplacerPlugin extends Plugin
 			}
 		}
 
+		autoOverrideMode = AutoOverrideMode.fromName(
+			configManager.getConfiguration(CONFIG_GROUP, AUTO_OVERRIDE_MODE_KEY));
+		// Defaults to true (the conservative option) when unset - an auto-apply
+		// that quietly transforms everyone already standing around you is a
+		// much bigger surprise than one that only affects players who newly
+		// walk into view.
+		final String onlyNewlySeen = configManager.getConfiguration(CONFIG_GROUP, AUTO_OVERRIDE_ONLY_NEWLY_SEEN_KEY);
+		autoOverrideOnlyNewlySeen = onlyNewlySeen == null || Boolean.parseBoolean(onlyNewlySeen);
+		// Defaults to false (npc animations playing) when unset - the same
+		// default every other apply path uses, and the one that actually shows
+		// off the replacement rather than puppeting it with player animations.
+		autoOverrideAnimationsDisabled = Boolean.parseBoolean(
+			configManager.getConfiguration(CONFIG_GROUP, AUTO_OVERRIDE_ANIMATIONS_DISABLED_KEY));
+
 		panel = injector.getInstance(PlayerNpcReplacerPanel.class);
 		navButton = NavigationButton.builder()
 			.tooltip("Player NPC Replacer")
@@ -632,6 +685,13 @@ public class PlayerNpcReplacerPlugin extends Plugin
 		clientToolbar.addNavigation(navButton);
 
 		clientThread.invokeLater(() -> renderCallbackManager.register(renderCallback));
+		// Everyone already rendered right now counts as "already seen", so
+		// enabling the plugin can't retroactively treat the current crowd as
+		// newly-arrived. PlayerSpawned doesn't re-fire for players who were
+		// already in the scene when this plugin started, so without this seed
+		// they'd have no entry at all and would look new the first time they
+		// walked out and back in.
+		clientThread.invokeLater(this::seedSeenPlayers);
 		overlayManager.add(highlightOverlay);
 	}
 
@@ -718,6 +778,11 @@ public class PlayerNpcReplacerPlugin extends Plugin
 			lastPlayerActionSubstituteId.clear();
 			pendingIdleAfterSwitch.clear();
 			recentlyHitUntilTick.clear();
+			// Session-only "already in view" baseline - a fresh startUp seeds
+			// it again from whoever is actually rendered at that point, which
+			// is the only meaningful answer after a disable/re-enable.
+			seenPlayerNames.clear();
+			autoOverrideOrderedIndex = 0;
 		});
 
 		// npcOverrides/playerOverrides intentionally kept in memory (though
@@ -2145,10 +2210,190 @@ public class PlayerNpcReplacerPlugin extends Plugin
 			localPlayerName = name;
 		}
 
+		// Recorded BEFORE any auto-apply decision, and the return value is what
+		// that decision uses - Set#add reports whether this name was absent,
+		// which is exactly "have we never seen this player before?". Doing it
+		// in this order (rather than checking, applying, then recording) means
+		// there's no path where an early return skips the bookkeeping and lets
+		// a player look new twice.
+		final boolean newlySeen = seenPlayerNames.add(name);
+
 		final PlayerOverride override = playerOverrides.get(name);
 		if (override != null && override.isEnabled())
 		{
 			replace(player, override.getReplacement());
+			return;
+		}
+
+		maybeAutoApplyOverride(player, name, newlySeen, override != null);
+	}
+
+	/**
+	 * The "Special operations" auto-override: gives a player who rendered with
+	 * no override of their own one drawn from the Active NPCs list, per {@link
+	 * #autoOverrideMode}.
+	 * <p>
+	 * Deliberately skipped for several cases beyond the obvious mode/empty-list
+	 * ones:
+	 * <ul>
+	 * <li>the LOCAL player - the feature is about other players rendering into
+	 * view, and silently transforming the user's own character (with all the
+	 * self-clone/equipment machinery that implies) is a different, much more
+	 * invasive thing than they asked for by ticking a box;</li>
+	 * <li>anyone who ALREADY has an override, including a currently-DISABLED
+	 * one - a disabled override is a deliberate user choice to not see that
+	 * player transformed right now, so quietly replacing it with a fresh
+	 * enabled one would override an explicit decision. {@code hasAnyOverride}
+	 * is passed in rather than re-derived so this reads off the same lookup
+	 * the caller already did;</li>
+	 * <li>players already seen this session, when {@link
+	 * #autoOverrideOnlyNewlySeen} is set - see {@link #seenPlayerNames}.</li>
+	 * </ul>
+	 * Animation state comes from {@link #autoOverrideAnimationsDisabled} (the
+	 * panel's NPC Animations Play/Paused control); equipment is always hidden.
+	 * Neither is inherited from anything - by definition there's no prior
+	 * override here to inherit from.
+	 * <p>
+	 * Deliberately NOT run through {@link NpcIndex#isPlayerShaped}'s safe-
+	 * default reset, unlike the single-target apply paths. That reset exists to
+	 * stop a per-player setting being silently CARRIED OVER onto a replacement
+	 * it can't work on; here the animation state is an explicit standing choice
+	 * the user made for this feature, so it's honored the same way the bulk
+	 * tools honor their own animations dropdown.
+	 */
+	private void maybeAutoApplyOverride(Player player, String name, boolean newlySeen, boolean hasAnyOverride)
+	{
+		if (autoOverrideMode == AutoOverrideMode.OFF
+			|| activeNpcs.isEmpty()
+			|| hasAnyOverride
+			|| player == client.getLocalPlayer())
+		{
+			return;
+		}
+		if (autoOverrideOnlyNewlySeen && !newlySeen)
+		{
+			return;
+		}
+
+		final NpcChoice choice = nextAutoOverrideChoice();
+		playerOverrides.put(name, new PlayerOverride(name, choice, true, autoOverrideAnimationsDisabled, false));
+		persistPlayerOverrides();
+		replace(player, choice);
+		pushPlayerOverridesRefresh();
+	}
+
+	/**
+	 * @return the next Active NPC to auto-assign. {@link
+	 * AutoOverrideMode#ORDERED} walks the list in order via {@link
+	 * #autoOverrideOrderedIndex}; {@link AutoOverrideMode#RANDOM} picks
+	 * independently each time (so repeats between consecutive players are
+	 * possible and expected - that's what random means here, not
+	 * "shuffled deal"). Callers must confirm {@link #activeNpcs} is non-empty.
+	 */
+	private NpcChoice nextAutoOverrideChoice()
+	{
+		if (autoOverrideMode == AutoOverrideMode.RANDOM)
+		{
+			return activeNpcs.get(autoOverrideRandom.nextInt(activeNpcs.size()));
+		}
+		// floorMod, not %, so this stays in range no matter how the Active list
+		// has been resized since the index was last advanced - and stays
+		// correct even if the index ever overflows into the negatives.
+		final NpcChoice choice = activeNpcs.get(Math.floorMod(autoOverrideOrderedIndex, activeNpcs.size()));
+		autoOverrideOrderedIndex++;
+		return choice;
+	}
+
+	/**
+	 * Marks every currently-rendered player as already seen, so they're never
+	 * treated as "newly seen" by {@link #maybeAutoApplyOverride}. Client-thread
+	 * only (walks the world view).
+	 */
+	private void seedSeenPlayers()
+	{
+		final WorldView worldView = client.getTopLevelWorldView();
+		if (worldView == null)
+		{
+			return;
+		}
+		for (Player player : worldView.players())
+		{
+			if (player != null && player.getName() != null)
+			{
+				seenPlayerNames.add(player.getName());
+			}
+		}
+	}
+
+	/** @return the current auto-override mode, for the panel's dropdown. */
+	AutoOverrideMode getAutoOverrideMode()
+	{
+		return autoOverrideMode;
+	}
+
+	/**
+	 * Sets and persists the auto-override mode. Switching AWAY from {@link
+	 * AutoOverrideMode#OFF} re-seeds {@link #seenPlayerNames} from whoever is
+	 * rendered right now, so turning the feature on mid-session treats the
+	 * current crowd as "already there" rather than auto-transforming all of
+	 * them the moment they next re-render.
+	 */
+	void setAutoOverrideMode(AutoOverrideMode mode)
+	{
+		final boolean turningOn = autoOverrideMode == AutoOverrideMode.OFF && mode != AutoOverrideMode.OFF;
+		autoOverrideMode = mode;
+		configManager.setConfiguration(CONFIG_GROUP, AUTO_OVERRIDE_MODE_KEY, mode.name());
+		if (turningOn)
+		{
+			clientThread.invoke(this::seedSeenPlayers);
+		}
+	}
+
+	/**
+	 * @return whether auto-applied overrides pause animations (showing the
+	 * player's own animations on the npc model) rather than playing the
+	 * replacement npc's own.
+	 */
+	boolean isAutoOverrideAnimationsDisabled()
+	{
+		return autoOverrideAnimationsDisabled;
+	}
+
+	/**
+	 * Sets and persists the auto-override animation state. Only affects
+	 * overrides applied from this point on - existing ones keep whatever they
+	 * were created with, same as changing the bulk tools' dropdown doesn't
+	 * retroactively rewrite already-applied bulk overrides. Each player's row
+	 * in "Overwritten Players" still toggles its own animation state
+	 * individually.
+	 */
+	void setAutoOverrideAnimationsDisabled(boolean animationsDisabled)
+	{
+		autoOverrideAnimationsDisabled = animationsDisabled;
+		configManager.setConfiguration(CONFIG_GROUP, AUTO_OVERRIDE_ANIMATIONS_DISABLED_KEY, animationsDisabled);
+	}
+
+	/** @return whether auto-override is restricted to players not yet seen this session. */
+	boolean isAutoOverrideOnlyNewlySeen()
+	{
+		return autoOverrideOnlyNewlySeen;
+	}
+
+	/**
+	 * Sets and persists the "only newly seen players" restriction. Enabling it
+	 * re-seeds {@link #seenPlayerNames} for the same reason {@link
+	 * #setAutoOverrideMode} does when turning the feature on: the setting means
+	 * "leave whoever is already here alone", which is only meaningful if
+	 * "already here" is evaluated at the moment it's switched on.
+	 */
+	void setAutoOverrideOnlyNewlySeen(boolean onlyNewlySeen)
+	{
+		final boolean turningOn = !autoOverrideOnlyNewlySeen && onlyNewlySeen;
+		autoOverrideOnlyNewlySeen = onlyNewlySeen;
+		configManager.setConfiguration(CONFIG_GROUP, AUTO_OVERRIDE_ONLY_NEWLY_SEEN_KEY, onlyNewlySeen);
+		if (turningOn)
+		{
+			clientThread.invoke(this::seedSeenPlayers);
 		}
 	}
 

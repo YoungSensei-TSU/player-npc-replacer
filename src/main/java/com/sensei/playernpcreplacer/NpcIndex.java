@@ -56,7 +56,17 @@ import net.runelite.client.util.Text;
  * #MAX_NPC_ID}'s own doc for the resulting maintenance requirement. Many ids
  * share a display name (regional/graphical variants of the same NPC, e.g. many
  * "Man" ids) or resolve to blank/"null" (unnamed/invisible markers) - both are
- * collapsed/filtered out, so the final list is one entry per distinct name.
+ * collapsed/filtered out, so the default list is one entry per distinct name.
+ * <p>
+ * That collapsing loses something real, though: a few npcs ship several
+ * genuinely DIFFERENT-looking models under a single name (Enakhra's fight
+ * phases), and keeping only the first id makes the others unreachable. So the
+ * index actually builds two lists - the one-per-name default, and a
+ * one-per-(name, model) list that {@link #search}'s {@code
+ * includeModelVariants} flag opts into. Sameness is judged on the composition's
+ * actual {@link NPCComposition#getModels()} array rather than on the name, so
+ * the dozens of ids that share a name AND an identical model still collapse
+ * either way - only genuinely different appearances get their own entry.
  * <p>
  * Some NPC names in the cache contain literal {@code <col=...>} formatting tags
  * (the game applies these in its own UI); those are stripped via
@@ -167,10 +177,34 @@ class NpcIndex
 	// and reading the last constant's value.
 	private static final int MAX_NPC_ID = 20000;
 
+	// Joins a name to its model signature when keying the variant map. Built
+	// from a char code rather than written as a literal so this source file
+	// stays plain text: NUL is the right choice (it can't appear in either
+	// half, so the two can never run together into a false match) but a raw
+	// control character in source makes tooling treat the file as binary.
+	private static final String KEY_SEPARATOR = String.valueOf((char) 0);
+
 	private final Client client;
 	private final ClientThread clientThread;
 
+	// One entry per distinct NAME - the default search space, and what this
+	// index has always returned. Built by collapsing everything in
+	// allVariants down to its first entry per name.
 	private volatile List<NpcChoice> all;
+
+	// One entry per distinct (name, model set) - so an npc that ships several
+	// genuinely different-looking models under one name (Enakhra's fight
+	// phases, say) contributes one entry each, while the dozens of ids that
+	// share a name AND an identical model (all the regional "Man" variants)
+	// still collapse to one. Only searched when the caller opts in, since for
+	// most npcs it's identical to `all` and the extra rows are just noise.
+	private volatile List<NpcChoice> allVariants;
+
+	// Lowercased names that have more than one entry in allVariants - i.e.
+	// exactly the names where a bare name is ambiguous and the id has to be
+	// shown to tell two results apart. Precomputed at build time so search
+	// doesn't have to re-derive it per query.
+	private volatile Set<String> ambiguousNames;
 
 	@Inject
 	NpcIndex(Client client, ClientThread clientThread)
@@ -234,30 +268,68 @@ class NpcIndex
 	 * BOTH {@link #BODY_BIPEDAL} and {@link #BODY_HUMAN} entries (a human IS
 	 * bipedal) - only {@link #BODY_HUMAN} is an exact match, since it's the
 	 * narrower category.
+	 * @param includeModelVariants when true, searches every distinct
+	 * (name, model) pair rather than just one entry per name - so an npc with
+	 * several different-looking models under one name (Enakhra's fight phases)
+	 * offers each of them separately. Results whose name is ambiguous (more
+	 * than one variant shares it) come back with their id appended, e.g.
+	 * {@code "Enakhra (11389)"}, since the name alone can't tell them apart.
+	 * <p>
+	 * That renaming is applied to the returned {@link NpcChoice} itself rather
+	 * than only at render time, deliberately: whatever the user picks here is
+	 * persisted and then shown in the Active list, the "Overwritten" lists and
+	 * the in-game right-click menu, all of which would otherwise display two
+	 * or more identical-looking rows with no way to tell which is which. Names
+	 * that aren't ambiguous are left completely untouched, so the ordinary
+	 * (unchecked) case never shows ids.
 	 */
-	List<NpcChoice> search(String query, Integer sizeFilter, String typeFilter, String bodyTypeFilter, int limit)
+	List<NpcChoice> search(String query, Integer sizeFilter, String typeFilter, String bodyTypeFilter,
+		boolean includeModelVariants, int limit)
 	{
-		if (all == null)
+		final List<NpcChoice> source = includeModelVariants ? allVariants : all;
+		if (source == null)
 		{
 			return Collections.emptyList();
 		}
 
 		final String q = query.trim().toLowerCase();
 
-		return all.stream()
+		return source.stream()
 			.filter(c -> q.isEmpty() || c.getName().toLowerCase().contains(q))
 			.filter(c -> sizeFilter == null || c.getSize() == sizeFilter)
 			.filter(c -> typeFilter == null || matchesType(c, typeFilter))
 			.filter(c -> bodyTypeFilter == null || matchesBodyType(c, bodyTypeFilter))
 			.limit(limit)
+			.map(c -> includeModelVariants ? disambiguate(c) : c)
 			.collect(Collectors.toList());
+	}
+
+	/**
+	 * @return {@code choice} with its id appended to its name if that name is
+	 * shared by more than one model variant, otherwise {@code choice}
+	 * unchanged. Only the display name differs - the id and every
+	 * classification field are carried through as-is.
+	 */
+	private NpcChoice disambiguate(NpcChoice choice)
+	{
+		if (ambiguousNames == null || !ambiguousNames.contains(choice.getName().toLowerCase()))
+		{
+			return choice;
+		}
+		return new NpcChoice(choice.getId(), choice.getName() + " (" + choice.getId() + ")",
+			choice.getSize(), choice.getType(), choice.getBodyType());
 	}
 
 	private void build()
 	{
-		// Keyed by lowercase name to dedupe the many ids that share a display name;
-		// first id encountered for a name wins (any of them renders the same NPC).
-		final TreeMap<String, NpcChoice> byName = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
+		// Keyed by "lowercase name + model signature" so an npc contributes one
+		// entry per genuinely DIFFERENT-looking model it ships under that name,
+		// rather than one per id. The many ids that share both a name and an
+		// identical model (regional/graphical duplicates - all the "Man" ids)
+		// still collapse to a single entry, which is what keeps this list from
+		// being mostly noise; first id encountered for a given
+		// name+model wins, and any of them renders identically by definition.
+		final TreeMap<String, NpcChoice> byNameAndModel = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
 
 		for (int id = 0; id <= MAX_NPC_ID; id++)
 		{
@@ -280,7 +352,13 @@ class NpcIndex
 					continue;
 				}
 
-				byName.putIfAbsent(name, new NpcChoice(id, name, comp.getSize(), classify(comp), classifyBody(name, comp.getSize())));
+				// NUL can't occur in either half, so the two can't run
+				// together into a false match. Written as an escape rather
+				// than a literal control character so the file stays plain
+				// text for tooling.
+				final String key = name + KEY_SEPARATOR + modelSignature(comp);
+				byNameAndModel.putIfAbsent(key,
+					new NpcChoice(id, name, comp.getSize(), classify(comp), classifyBody(name, comp.getSize())));
 			}
 			catch (Exception ignored)
 			{
@@ -288,9 +366,55 @@ class NpcIndex
 			}
 		}
 
-		final List<NpcChoice> list = new ArrayList<>(byName.values());
-		list.sort(Comparator.comparing(NpcChoice::getName, String.CASE_INSENSITIVE_ORDER));
-		this.all = list;
+		final List<NpcChoice> variants = new ArrayList<>(byNameAndModel.values());
+		// Name first (the user-visible ordering), then id purely so entries
+		// sharing a name have a stable, predictable order rather than
+		// whatever the map iteration happened to produce.
+		variants.sort(Comparator.comparing(NpcChoice::getName, String.CASE_INSENSITIVE_ORDER)
+			.thenComparingInt(NpcChoice::getId));
+
+		// Collapse to one-per-name for the default search space, and record
+		// which names needed collapsing - those are exactly the ones a bare
+		// name can't distinguish, so search() appends the id for them.
+		final List<NpcChoice> primary = new ArrayList<>();
+		final Set<String> seen = new HashSet<>();
+		final Set<String> ambiguous = new HashSet<>();
+		for (NpcChoice choice : variants)
+		{
+			if (seen.add(choice.getName().toLowerCase()))
+			{
+				primary.add(choice);
+			}
+			else
+			{
+				ambiguous.add(choice.getName().toLowerCase());
+			}
+		}
+
+		this.allVariants = variants;
+		this.ambiguousNames = ambiguous;
+		this.all = primary;
+	}
+
+	/**
+	 * @return a stable string identifying this npc's model set, for
+	 * distinguishing same-named npcs that genuinely look different from ones
+	 * that are merely duplicate ids of the same appearance. Uses the raw model
+	 * id array as-is (NOT sorted): order is part of how the composed model is
+	 * built, and two npcs listing the same parts in a different order are not
+	 * guaranteed to render identically.
+	 */
+	private static String modelSignature(NPCComposition comp)
+	{
+		final int[] models = comp.getModels();
+		if (models == null)
+		{
+			// Distinct from the empty-array signature - "no model data at all"
+			// and "an explicitly empty model list" shouldn't be collapsed into
+			// each other.
+			return "null";
+		}
+		return Arrays.toString(models);
 	}
 
 	private static String classify(NPCComposition comp)
